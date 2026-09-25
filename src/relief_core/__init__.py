@@ -1,5 +1,6 @@
 """企业合规档案基础服务的服务端基础包。"""
 
+from .relief_service import ReliefService
 from .service import DomainService
 
-__all__ = ["DomainService"]
+__all__ = ["DomainService", "ReliefService"]

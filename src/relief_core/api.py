@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .relief_service import ReliefService
 from .service import DomainService
 from .storage import Database
 
@@ -55,10 +57,76 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return 400, {"error": "invalid_request", "message": str(exc)}
 
 
+# “无事不扰”资格服务的写动作与领域方法的映射（请求体整体透传）。
+RELIEF_POST_ROUTES = {
+    "/rule-sets/propose": ("propose_rule_set", 201),
+    "/rule-sets/approve": ("approve_rule_set", 200),
+    "/rule-sets/publish": ("publish_rule_set", 200),
+    "/facts": ("record_fact", 201),
+    "/corrections/apply": ("apply_correction", 200),
+    "/corrections/dismiss": ("dismiss_correction", 200),
+    "/snapshots/settle": ("settle_day", 201),
+    "/windows/suspend": ("suspend_window", 200),
+    "/windows/terminate": ("terminate_window", 200),
+    "/exceptions/resolve": ("resolve_breakthrough", 200),
+    "/reviews/request": ("request_review", 201),
+    "/reviews/decide": ("decide_review", 200),
+}
+
+
+def relief_route(service: ReliefService, method: str, path: str, body: dict[str, Any] | None,
+                 headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    """把“无事不扰”资格相关请求分派到 ReliefService。"""
+
+    headers = headers or {}
+    body = body or {}
+    parsed = urlparse(path)
+    query = parse_qs(parsed.query)
+    actor_id = headers.get("X-Actor-Id", "")
+
+    def arg(name: str, default: str | None = None) -> str:
+        value = query.get(name, [default])[0]
+        if value is None or value == "":
+            raise ValidationError(f"{name} 不能为空")
+        return value
+
+    try:
+        if method == "POST" and parsed.path in RELIEF_POST_ROUTES:
+            method_name, created_status = RELIEF_POST_ROUTES[parsed.path]
+            result = getattr(service, method_name)(actor_id=actor_id, **body)
+            status = 200 if result.get("replayed") else created_status
+            return status, result
+        if method == "GET" and parsed.path == "/rule-sets":
+            return 200, {"items": [asdict(item) for item in service.list_rule_sets()]}
+        if method == "GET" and parsed.path == "/corrections":
+            site_id = query.get("site_id", [None])[0]
+            return 200, {"items": service.list_pending_corrections(actor_id, site_id)}
+        if method == "GET" and parsed.path == "/snapshots":
+            snapshot = service.get_snapshot(arg("site_id"), arg("business_date"))
+            return 200, asdict(snapshot)
+        if method == "GET" and parsed.path == "/snapshots/latest":
+            snapshot = service.latest_snapshot(arg("site_id"))
+            return 200, asdict(snapshot) if snapshot else {"item": None}
+        if method == "GET" and parsed.path == "/windows":
+            return 200, {"items": [asdict(item) for item in service.list_windows(arg("site_id"))]}
+        if method == "GET" and parsed.path == "/exceptions":
+            return 200, {"items": [asdict(item) for item in service.list_exceptions(arg("window_id"))]}
+        if method == "GET" and parsed.path == "/reviews":
+            return 200, asdict(service.get_review(arg("review_id")))
+        if method == "GET" and parsed.path == "/qualification/explain":
+            return 200, service.explain_qualification(actor_id, arg("site_id"))
+        return 404, {"error": "route_not_found", "message": "接口不存在"}
+    except DomainError as exc:
+        return exc.status, {"error": exc.code, "message": str(exc)}
+    except (TypeError, ValueError) as exc:
+        return 400, {"error": "invalid_request", "message": str(exc)}
+
+
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    relief_service: ReliefService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -68,8 +136,13 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
-        status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+        headers = {"X-Actor-Id": self.headers.get("X-Actor-Id", "")}
+        path = self.path
+        if path.startswith(("/rule-sets", "/facts", "/corrections", "/snapshots",
+                            "/windows", "/exceptions", "/reviews", "/qualification")):
+            status, payload = relief_route(self.relief_service, self.command, path, body, headers)
+        else:
+            status, payload = route(self.service, self.command, path, body, headers)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +173,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.relief_service = ReliefService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
